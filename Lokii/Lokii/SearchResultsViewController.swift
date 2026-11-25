@@ -3177,6 +3177,40 @@ final class SearchResultsViewController: NSViewController {
         return ext == "app" || ext == "prefpane"
     }
 
+    private static func isPackageBundle(path: String) -> Bool {
+        let ext = fileExtensionLowercased(of: path)
+        switch ext {
+        case "key", "numbers", "pages", "rtfd", "photoslibrary", "fcpbundle", "logicx", "band", "garageband":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isICloudPath(_ path: String) -> Bool {
+        path.contains("/Library/Mobile Documents/") || path.hasSuffix("/Library/Mobile Documents")
+    }
+
+    private func icloudBadgedIcon(base: NSImage, baseKey: String) -> NSImage {
+        let badgedKey = baseKey + "__icloud"
+        if let cached = typeIconCache[badgedKey] { return cached }
+        let size = NSSize(width: 18, height: 18)
+        let composed = NSImage(size: size, flipped: false) { rect in
+            base.draw(in: rect)
+            let pillRect = NSRect(x: 7.5, y: 0.0, width: 10.5, height: 8.0)
+            NSColor.white.withAlphaComponent(0.92).setFill()
+            NSBezierPath(roundedRect: pillRect, xRadius: 3.5, yRadius: 3.5).fill()
+            if let symbol = NSImage(systemSymbolName: "icloud.fill", accessibilityDescription: nil) {
+                let cfg = NSImage.SymbolConfiguration(paletteColors: [.systemBlue])
+                let styled = symbol.withSymbolConfiguration(cfg) ?? symbol
+                styled.draw(in: pillRect.insetBy(dx: 1.0, dy: 0.8))
+            }
+            return true
+        }
+        typeIconCache[badgedKey] = composed
+        return composed
+    }
+
     private func nonBlockingVolumeIcon() -> NSImage {
         let key = "__type_icon_volume__"
         if let cached = typeIconCache[key] { return cached }
@@ -3186,20 +3220,31 @@ final class SearchResultsViewController: NSViewController {
     }
 
     private func nonBlockingTypeIcon(for path: String, isDir: Bool, fileExtension: String? = nil) -> NSImage {
-        if isDir && !Self.needsCustomBundleIcon(path: path) {
+        let isICloud = Self.isICloudPath(path)
+        if isDir && !Self.needsCustomBundleIcon(path: path) && !Self.isPackageBundle(path: path) {
             let key = "__type_icon_dir__"
-            if let cached = typeIconCache[key] { return cached }
-            let icon = NSWorkspace.shared.icon(for: .folder)
-            typeIconCache[key] = icon
-            return icon
+            let base: NSImage
+            if let cached = typeIconCache[key] {
+                base = cached
+            } else {
+                let icon = NSWorkspace.shared.icon(for: .folder)
+                typeIconCache[key] = icon
+                base = icon
+            }
+            return isICloud ? icloudBadgedIcon(base: base, baseKey: key) : base
         }
         let ext = (fileExtension?.isEmpty == false ? fileExtension!.lowercased() : Self.fileExtensionLowercased(of: path))
         let key = "__type_icon_ext_\(ext)"
-        if let cached = typeIconCache[key] { return cached }
-        let utType = ext.isEmpty ? UTType.data : (UTType(filenameExtension: ext) ?? .data)
-        let icon = NSWorkspace.shared.icon(for: utType)
-        typeIconCache[key] = icon
-        return icon
+        let base: NSImage
+        if let cached = typeIconCache[key] {
+            base = cached
+        } else {
+            let utType = ext.isEmpty ? UTType.data : (UTType(filenameExtension: ext) ?? .data)
+            let icon = NSWorkspace.shared.icon(for: utType)
+            typeIconCache[key] = icon
+            base = icon
+        }
+        return isICloud ? icloudBadgedIcon(base: base, baseKey: key) : base
     }
 
     func iconForFile(at path: String, isDir: Bool = false, isOffline: Bool = false, fileExtension: String? = nil) -> NSImage {
