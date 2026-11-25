@@ -463,7 +463,8 @@ fn scan_borrowed_with_sink(
                                             is_dir: bool,
                                             size: u64,
                                             modified: u64,
-                                            created_at: u64|
+                                            created_at: u64,
+                                            is_dataless: bool|
                      -> Result<(), VolumeScanError> {
                         path_buf.truncate(prefix_len);
                         path_buf.push_str(name);
@@ -482,7 +483,7 @@ fn scan_borrowed_with_sink(
                             crate::filter::ScopeDecision::HardDrop => return Ok(()),
                             crate::filter::ScopeDecision::IndexShallowContainer => {}
                             crate::filter::ScopeDecision::IndexNormally => {
-                                if is_dir {
+                                if is_dir && !is_dataless {
                                     // 用原始 OsStr 拼接子目录路径，避免非 UTF-8 目录名经 lossy 解码后 open 返回 ENOENT 丢子树
                                     subdirs.push(dir.join(raw_name));
                                 }
@@ -710,9 +711,13 @@ mod macos_bulk {
     const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
     const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
     const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+    const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
     const ATTR_CMN_ERROR: u32 = 0x2000_0000;
     const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
     const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+
+    /// macOS `<sys/stat.h>` `SF_DATALESS`: 云端未物化条目，避免 `open()` 触发下载或阻塞。
+    const SF_DATALESS: u32 = 0x4000_0000;
 
     /// macOS `enum vtype`: `VNON = 0, VREG = 1, VDIR = 2`.
     const VDIR: u32 = 2;
@@ -776,7 +781,7 @@ mod macos_bulk {
         buf: &mut [u64],
         cancel: &AtomicBool,
         is_mounted: &dyn Fn() -> bool,
-        mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64) -> Result<(), VolumeScanError>,
+        mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64, bool) -> Result<(), VolumeScanError>,
     ) -> Result<BulkOutcome, VolumeScanError> {
         let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
             return Ok(BulkOutcome::Unsupported);
@@ -806,7 +811,8 @@ mod macos_bulk {
             | ATTR_CMN_NAME
             | ATTR_CMN_OBJTYPE
             | ATTR_CMN_CRTIME
-            | ATTR_CMN_MODTIME;
+            | ATTR_CMN_MODTIME
+            | ATTR_CMN_FLAGS;
         attrlist.fileattr = ATTR_FILE_DATALENGTH;
 
         let buf_bytes = buf.len() * std::mem::size_of::<u64>();
@@ -959,6 +965,19 @@ mod macos_bulk {
                     modified = ts.tv_sec.max(0) as u64;
                 }
 
+                let mut is_dataless = false;
+                if (returned.commonattr & ATTR_CMN_FLAGS) != 0 {
+                    if cursor + 4 > entry_end {
+                        pos = entry_end;
+                        continue;
+                    }
+                    let flags = unsafe {
+                        std::ptr::read_unaligned(raw.as_ptr().add(cursor) as *const u32)
+                    };
+                    cursor += 4;
+                    is_dataless = (flags & SF_DATALESS) != 0;
+                }
+
                 let mut size = 0u64;
                 if (returned.fileattr & ATTR_FILE_DATALENGTH) != 0 {
                     if cursor + 8 <= entry_end {
@@ -976,11 +995,11 @@ mod macos_bulk {
                         let raw_os = std::ffi::OsStr::from_bytes(bytes);
                         match std::str::from_utf8(bytes) {
                             Ok(name) => {
-                                on_entry(raw_os, name, is_dir, size, modified, created_at)?;
+                                on_entry(raw_os, name, is_dir, size, modified, created_at, is_dataless)?;
                             }
                             Err(_) => {
                                 let owned = String::from_utf8_lossy(bytes);
-                                on_entry(raw_os, &owned, is_dir, size, modified, created_at)?;
+                                on_entry(raw_os, &owned, is_dir, size, modified, created_at, is_dataless)?;
                             }
                         }
                     }
@@ -998,7 +1017,7 @@ fn enumerate_dir_fallback(
     abort_on_disconnect: bool,
     cancel: &std::sync::atomic::AtomicBool,
     is_mounted: &dyn Fn() -> bool,
-    mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64) -> Result<(), VolumeScanError>,
+    mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64, bool) -> Result<(), VolumeScanError>,
 ) -> Result<(), VolumeScanError> {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -1041,7 +1060,7 @@ fn enumerate_dir_fallback(
         let size = if is_dir { 0 } else { meta.len() };
         let modified = system_time_to_unix_secs(meta.modified());
         let created_at = system_time_to_unix_secs(meta.created());
-        on_entry(&name, &name_str, is_dir, size, modified, created_at)?;
+        on_entry(&name, &name_str, is_dir, size, modified, created_at, false)?;
     }
     Ok(())
 }
@@ -1147,7 +1166,8 @@ pub fn scan_volume_compact_atomic(
                                 is_dir: bool,
                                 size: u64,
                                 modified: u64,
-                                created_at: u64|
+                                created_at: u64,
+                                is_dataless: bool|
          -> Result<(), VolumeScanError> {
             path_buf.truncate(prefix_len);
             path_buf.push_str(name);
@@ -1156,7 +1176,7 @@ pub fn scan_volume_compact_atomic(
                 crate::filter::ScopeDecision::HardDrop => return Ok(()),
                 crate::filter::ScopeDecision::IndexShallowContainer => {}
                 crate::filter::ScopeDecision::IndexNormally => {
-                    if is_dir {
+                    if is_dir && !is_dataless {
                         dirs.push_back(dir.join(raw_name));
                     }
                 }
@@ -1346,7 +1366,8 @@ pub fn scan_volume_compact_atomic_parallel(
                                             is_dir: bool,
                                             size: u64,
                                             modified: u64,
-                                            created_at: u64|
+                                            created_at: u64,
+                                            is_dataless: bool|
                      -> Result<(), VolumeScanError> {
                         if local_abort_ref.load(Ordering::Relaxed) {
                             return Err(VolumeScanError::Cancelled);
@@ -1359,7 +1380,7 @@ pub fn scan_volume_compact_atomic_parallel(
                             crate::filter::ScopeDecision::HardDrop => return Ok(()),
                             crate::filter::ScopeDecision::IndexShallowContainer => {}
                             crate::filter::ScopeDecision::IndexNormally => {
-                                if is_dir {
+                                if is_dir && !is_dataless {
                                     subdirs.push(dir.join(raw_name));
                                 }
                             }

@@ -123,6 +123,30 @@ fn is_app_bundle_name(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 是否为 macOS 常见文档/媒体包目录（如 iWork `.key`/`.numbers`/`.pages`），
+/// 在 Finder 中表现为单个文件，不应递归展开内部目录（尤其是 iCloud 未下载的包会阻塞扫描）。
+fn is_package_bundle_name(name: &str) -> bool {
+    const PACKAGE_BUNDLE_EXTS: [&str; 9] = [
+        "key",
+        "numbers",
+        "pages",
+        "rtfd",
+        "photoslibrary",
+        "fcpbundle",
+        "logicx",
+        "band",
+        "garageband",
+    ];
+    name.rsplit_once('.')
+        .map(|(stem, ext)| {
+            !stem.is_empty()
+                && PACKAGE_BUNDLE_EXTS
+                    .iter()
+                    .any(|pkg| ext.eq_ignore_ascii_case(pkg))
+        })
+        .unwrap_or(false)
+}
+
 /// 判定给定路径的末端文件名是否命中系统噪声。
 pub(crate) fn is_system_noise_path(path: &Path) -> bool {
     path.file_name()
@@ -375,7 +399,7 @@ impl IndexScopePolicy {
             {
                 return ScopeDecision::HardDrop;
             }
-            if self.index_apps && is_app_bundle_name(&name) {
+            if (self.index_apps && is_app_bundle_name(&name)) || is_package_bundle_name(&name) {
                 return if comps.peek().is_some() {
                     // 包内部：与 Finder 把包当作单个文件的语义一致
                     ScopeDecision::HardDrop
@@ -449,7 +473,7 @@ impl IndexScopePolicy {
         {
             return ScopeDecision::HardDrop;
         }
-        if self.index_apps && is_app_bundle_name(child_name) {
+        if (self.index_apps && is_app_bundle_name(child_name)) || is_package_bundle_name(child_name) {
             return if is_dir {
                 ScopeDecision::IndexShallowContainer
             } else {
